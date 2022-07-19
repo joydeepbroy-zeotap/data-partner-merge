@@ -2,10 +2,11 @@ package com.zeotap.merge.dp.poc
 
 import io.delta.tables.{DeltaMergeBuilder, DeltaTable}
 import org.apache.spark.SparkConf
-import org.apache.spark.sql.functions.{col, lit, when}
-import org.apache.spark.sql.types.{DataType, IntegerType, StringType}
-import org.apache.spark.sql.{Column, DataFrame, SparkSession}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
 
+import java.time.LocalDateTime
 import scala.collection.mutable
 
 
@@ -20,13 +21,112 @@ object Deltalake {
   val snapshot = "snapshot"
   val update = "updates"
 
+  val snapshotRow = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", 25, 35, "Female")
+  val allFilledUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", 45, 75, "Male")
+  val allNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", null, null, null)
+  val genderNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", 15, 55, null)
+  val minAgeNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", null, 65, "Female")
+  val maxAgeNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", 20, null, "Male")
+  val ageNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", null, null, "Female")
+  val MaxAgeAndGenderNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", 23, null, null)
+  val columns = List(("Demographic_MinAge", IntegerType), ("Demographic_MaxAge", IntegerType), ("Demographic_Gender", StringType),("brands",StringType))
+
+  def createDeltaTableFromSingleRow(path: String, r: Row)(implicit spark: SparkSession) = {
+    createDeltaTableFromDataframe(createDataframeFromSingleRow(r), path)
+    path
+  }
+
+
+  def createDataframeFromSingleRow(r: Row)(implicit spark: SparkSession) = {
+    val schema = StructType(Seq(
+      StructField("id_type", StringType, true),
+      StructField("id", StringType, true),
+      StructField("Demographic_MinAge", IntegerType, true),
+      StructField("Demographic_MaxAge", IntegerType, true),
+      StructField("Demographic_Gender", StringType, true),
+    ))
+    spark.createDataFrame(spark.sparkContext.parallelize(Seq(r)), schema)
+  }
+
+  val id_type_condition = joinCondition(snapshot, update, "id_type")
+  val id_condition = joinCondition(snapshot, update, "id")
+
+  def generatedDataframeUseCase(path: String)(implicit spark: SparkSession) = {
+    val deltaTable = DeltaTable.forPath(spark, createDeltaTableFromSingleRow(path, snapshotRow)).as(snapshot)
+    println(">>>>>>>>>>STARTED AT>>>>>>>>>>>>>>>>")
+    deltaTable.toDF.show(false)
+    println(">>>>>>>>>>STARTED AT>>>>>>>>>>>>>>>>")
+    val rows = List(
+      allFilledUpdate,
+      allNullUpdate,
+      genderNullUpdate,
+      minAgeNullUpdate,
+      maxAgeNullUpdate,
+      ageNullUpdate,
+      MaxAgeAndGenderNullUpdate
+    )
+    val useCases: List[DataFrame] = rows.map(x => createDataframeFromSingleRow(x))
+
+    useCases.foreach(cdc => {
+      val mergeBuilder = deltaTable
+        .as(snapshot)
+        .merge(cdc.as(update), s"$id_condition and $id_type_condition")
+
+      val updateSetWithConditions = getNVLMapUsingCoalesceAndWhenOnUpdateHasNullWithoutCast(update, columns)
+
+      mergeBuilder.whenMatched()
+        .update(updateSetWithConditions)
+        .execute()
+
+      println(">>>>>>>>>CDC DATA VIEW>>>>>>>>>>>>>")
+      cdc.show(false)
+
+      println(">>>>>>>>>>>>ACTUAL RESULT VIEW>>>>>>>>>>>>>")
+      deltaTable.toDF.show(false)
+      println(">>>>>>>>>>>>ACTUAL RESULT VIEW>>>>>>>>>>>>>")
+    })
+
+
+  }
+
+  val mapColumnStandardizer = udf[mutable.Map[String, (Long, String)], mutable.Map[String, (Long, String)], String](reconcileMapColumnWithSplit _)
+
+  def reconcileMapColumnWithSplit(master: mutable.Map[String, (Long, String)], update: String): mutable.Map[String, (Long, String)] = if (update.isEmpty || update.equals(null))
+    master
+  else reconcileMapColumn(
+    master,
+    update.split(",").map(a => (a, (1l, LocalDateTime.now().toString))).toMap)
+
+
+  def reconcileMapColumn(master: mutable.Map[String, (Long, String)], update: Map[String, (Long, String)]): mutable.Map[String, (Long, String)] = if (update.isEmpty)
+    master
+  else {
+    val mapColumnElement = update.head
+    val name = mapColumnElement._1
+    val weight = mapColumnElement._2._1
+    val timestamp = mapColumnElement._2._2
+    if (!master.contains(name))
+      master += mapColumnElement
+    else {
+      val tuple = master(name)
+      master.update(name, (tuple._1 + weight, LocalDateTime.now().toString))
+    }
+    reconcileMapColumn(master, update.tail)
+  }
+
+  def createDeltaTableFromDataframe(df: DataFrame, path: String) = df.write.format("delta").save(path)
+
   def main(args: Array[String]): Unit = {
     val conf: SparkConf = new SparkConf()
-    val spark = SparkSession.builder()
+    implicit val spark = SparkSession.builder()
       .master("local")
       .appName("DELTA LAKE POC")
       .config(conf)
       .getOrCreate()
+    spark.sparkContext.setLogLevel("OFF")
+
+
+    //generatedDataframeUseCase("/Users/joydeep/IdeaProjects/data-partner-merge/src/main/resources/delta/testWhenExp/")
 
     val deltaTable = DeltaTable.forPath(spark, basePath).as(snapshot)
     val updates = spark.read.format("avro").load("/Users/joydeep/Downloads/ael/onaudience")
@@ -37,8 +137,7 @@ object Deltalake {
     spark.sql(s"CREATE TABLE snapshot USING DELTA LOCATION '$basePath'")
     spark.sql("select * from default.snapshot").show()
 
-    val id_type_condition = joinCondition(snapshot, update, "id_type")
-    val id_condition = joinCondition(snapshot, update, "id")
+
 
     //val intersectionDF = deltaTable.toDF.select("id", "id_type").distinct().intersect(explodedUpdates.select("id", "id_type").distinct())
     //intersectionDF.show(false)
@@ -47,13 +146,13 @@ object Deltalake {
     val cdc = explodedUpdates.filter("id == '133900b3-44f1-43fe-873f-f4bde3dfd6af'")
       //.drop("Demographic_Gender")
       .withColumn("Demographic_Gender",
-        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), "FEMAL").otherwise(col("Demographic_Gender")))
+        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), null).otherwise(col("Demographic_Gender")))
       .withColumn("Demographic_MinAge",
-        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), lit(801).cast(IntegerType)).otherwise(col("Demographic_MinAge")))
+        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), lit(null).cast(IntegerType)).otherwise(col("Demographic_MinAge")))
       .withColumn("Demographic_MaxAge",
-        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), 1901).otherwise(col("Demographic_MaxAge")))
+        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), 78).otherwise(col("Demographic_MaxAge")))
     //val columns = List("Demographic_MinAge", "Demographic_MaxAge", "Demographic_Gender")
-    val columns = List(("Demographic_MinAge", IntegerType), ("Demographic_MaxAge", IntegerType), ("Demographic_Gender", StringType))
+    //val columns = List(("Demographic_MinAge", IntegerType), ("Demographic_MaxAge", IntegerType), ("Demographic_Gender", StringType))
 
 
     val dmb: DeltaMergeBuilder = deltaTable
@@ -61,29 +160,35 @@ object Deltalake {
       .merge(cdc.as(update), s"$id_condition and $id_type_condition")
 
 
-//    val deltaMergeBuilder = builderWithSimpleMatch(dmb)
-//    deltaMergeBuilder.execute()
+    //    val deltaMergeBuilder = builderWithSimpleMatch(dmb)
+    //    deltaMergeBuilder.execute()
 
-//    val colBuilder: DeltaMergeBuilder = builderWithForMatch(update, columns, dmb)
-//    colBuilder.execute()
+    //    val colBuilder: DeltaMergeBuilder = builderWithForMatch(update, columns, dmb)
+    //    colBuilder.execute()
 
-    //val updateSetWithConditions: mutable.Map[String, Column] = computeNVLMap(snapshot, update, columns)
-    val updateSetWithConditions = getNVLMap2(update, columns)
+    //val updateSetWithConditions: mutable.Map[String, Column] = getNVLMapUsingWhen(snapshot, update, columns)
+    val updateSetWithConditions = getNVLMapUsingCoalesceAndWhenOnUpdateHasNullWithoutCast(update, columns)
+    val allConditions = getNVLMapForDynamicColumns(updateSetWithConditions)(columns)
 
     val updateBuilder = dmb.whenMatched()
-      .update(updateSetWithConditions)
+      .update(allConditions)
     //          /*.whenNotMatched()
     //          .insertAll()*/
     //
     updateBuilder.execute()
 
-    println("here")
-    //
-    //        val builder= naiveBuilderWithAND(snapshot, update, deltaTable, id_type_condition, id_condition, cdc)
-    //        builder.execute()
-    //    deltaTable.toDF.show()
+    println("debugger stops here!")
 
   }
+
+
+  private def getNVLMapForDynamicColumns(conditions: scala.collection.mutable.Map[String, Column])(columns: List[(String, DataType)]) = columns
+    .foldLeft(conditions)((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
+      case "brands" | "Interest_IAB" => d += (s"${name._1}.key" -> when(col(s"${update}.${name._1}").isNotNull,
+        mapColumnStandardizer(col(s"${snapshot}.${name._1}"), col(s"${update}.${name._1}")))
+        .otherwise(col(s"${snapshot}.${name._1}")))
+      case _ => conditions
+    })
 
   private def builderWithForMatch(update: Format, columns: List[String], dmb: DeltaMergeBuilder) = {
     columns
@@ -108,30 +213,75 @@ object Deltalake {
 
 
   private def naiveBuilderWithAND(snapshot: Format, update: Format, deltaTable: DeltaTable, id_type_condition: String, id_condition: String, cdc: DataFrame) = deltaTable
-      .as(snapshot)
-      .merge(cdc.as(update), s"$id_condition and $id_type_condition")
-      .whenMatched("updates.Demographic_MinAge is not null and updates.Demographic_MaxAge is not null and updates.Demographic_Gender is not null")
-      .updateExpr(
-        Map(
-          "Demographic_MinAge" -> "updates.Demographic_MinAge",
-          "Demographic_MaxAge" -> "updates.Demographic_MaxAge",
-          "Demographic_Gender" -> "updates.Demographic_Gender"
-        ))
+    .as(snapshot)
+    .merge(cdc.as(update), s"$id_condition and $id_type_condition")
+    .whenMatched("updates.Demographic_MinAge is not null and updates.Demographic_MaxAge is not null and updates.Demographic_Gender is not null")
+    .updateExpr(
+      Map(
+        "Demographic_MinAge" -> "updates.Demographic_MinAge",
+        "Demographic_MaxAge" -> "updates.Demographic_MaxAge",
+        "Demographic_Gender" -> "updates.Demographic_Gender"
+      ))
+
+  private def getNVLMapUsingCoalesceAndWhen(update: Format, columns: List[(String, DataType)]) = columns
+    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
+      case "Demographic_MinAge" => d += (s"${name._1}" -> when(col(s"${snapshot}.${name._1}").equalTo(lit(25)), col(s"${update}.${name._1}"))
+        .otherwise(col(s"${snapshot}.${name._1}")))
+      case _ => addCoalesceToMap(update, d, name)
+    })
+
+  private def getNVLMapUsingCoalesceAndWhenOnUpdate(update: Format, columns: List[(String, DataType)]) = columns
+    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
+      case "Demographic_MinAge" => d += (s"${name._1}" -> when(col(s"${update}.${name._1}").equalTo(lit(45)), col(s"${update}.${name._1}"))
+        .otherwise(col(s"${snapshot}.${name._1}")))
+      case _ => addCoalesceToMap(update, d, name)
+    })
+
+  private def addCoalesceToMap(update: Format, d: mutable.Map[String, Column], name: (String, DataType)) = d +=
+    (s"${name._1}" -> coalesce(col(s"${update}.${name._1}"), col(s"${snapshot}.${name._1}")))
 
 
-  private def getNVLMap2(update: Format, columns: List[(String, DataType)]) = columns
-      .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => {
-        d += (s"${name._1}" ->
-          when(col(s"${update}.${name._1}") === lit(null).cast(name._2), col(s"${snapshot}.${name._1}"))
-            .otherwise(col(s"${update}.${name._1}"))
+  private def getNVLMapUsingCoalesceAndWhenOnUpdateHasNull(update: Format, columns: List[(String, DataType)]) = columns
+    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
+      case "Demographic_MinAge" => d += (s"${name._1}" -> when(col(s"${update}.${name._1}").equalTo(lit(null).cast(name._2)), col(s"${update}.${name._1}"))
+        .otherwise(col(s"${snapshot}.${name._1}")))
+      case _ => addCoalesceToMap(update, d, name)
+    })
+
+  private def getNVLMapUsingCoalesceAndWhenOnUpdateHasNullWithoutCast(update: Format, columns: List[(String, DataType)]) = columns
+    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
+      case "Demographic_MinAge" => d += (s"${name._1}" -> when(col(s"${update}.${name._1}").isNull, col(s"${update}.${name._1}"))
+        .otherwise(col(s"${snapshot}.${name._1}")))
+      case "brands" => d
+      case _ => addCoalesceToMap(update, d, name)
+    })
+
+  private def getNVLMapUsingCoalesce(update: Format, columns: List[(String, DataType)]) = columns
+    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => {
+      addCoalesceToMap(update, d, name)
+    })
+
+  private def getNVLMapUsingWhenAndCast(update: Format, columns: List[(String, DataType)]) = columns
+    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => {
+      d += (s"${name._1}" ->
+        when(col(s"${update}.${name._1}") === lit(null).cast(name._2),
+          col(s"${snapshot}.${name._1}"))
+          .otherwise(
+            col(s"${update}.${name._1}")
           )
-      })
+        )
+    })
 
 
-  private def computeNVLMap(snapshot: Format, update: String, columns: List[String]) = columns
-    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: String) => {
-      d += (s"${name}" -> when(col(s"${update}.${name}") === null, col(s"${snapshot}.${name}"))
-        .otherwise(col(s"${update}.${name}")))
+  private def getNVLMapUsingWhen(update: String, columns: List[(String, DataType)]) = columns
+    .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => {
+      d += (s"${name._1}" ->
+        when(col(s"${update}.${name._1}") === null,
+          col(s"${snapshot}.${name._1}"))
+          .otherwise(
+            col(s"${update}.${name._1}")
+          )
+        )
     })
 
   def joinCondition(snapshot: String, updates: String, column: String): String = s"$snapshot.$column = $updates.$column"
@@ -140,8 +290,10 @@ object Deltalake {
     format match {
       case "avro" =>
         val df = sparkSession.read.format("avro").load(path).write.format("delta")
-        df.save("/Users/joydeep/IdeaProjects/data-partner-merge/src/main/resources/delta/onaudience/dpm/base")
+        df.save(path)
     }
     path
   }
+
+
 }
