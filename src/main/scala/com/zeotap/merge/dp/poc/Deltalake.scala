@@ -6,7 +6,6 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
 
-import java.time.LocalDateTime
 import scala.collection.mutable
 
 
@@ -29,7 +28,7 @@ object Deltalake {
   val maxAgeNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", 20, null, "Male")
   val ageNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", null, null, "Female")
   val MaxAgeAndGenderNullUpdate = Row("id_mid_10", "133900b3-44f1-43fe-873f-f4bde3dfd6af", 23, null, null)
-  val columns = List(("Demographic_MinAge", IntegerType), ("Demographic_MaxAge", IntegerType), ("Demographic_Gender", StringType),("brands",StringType))
+  val columns = List(("Demographic_MinAge", IntegerType), ("Demographic_MaxAge", IntegerType), ("Demographic_Gender", StringType),("Interest_IAB",StringType))
 
   def createDeltaTableFromSingleRow(path: String, r: Row)(implicit spark: SparkSession) = {
     createDeltaTableFromDataframe(createDataframeFromSingleRow(r), path)
@@ -89,29 +88,36 @@ object Deltalake {
 
   }
 
-  val mapColumnStandardizer = udf[mutable.Map[String, (Long, String)], mutable.Map[String, (Long, String)], String](reconcileMapColumnWithSplit _)
+  val mapColumnStandardizer1 = udf(reconcileMapColumnWithSplit1 _)
+  //udf[mutable.Map[String, (Long, String)], mutable.Map[String, (Long, String)], String](reconcileMapColumnWithSplit _)
 
-  def reconcileMapColumnWithSplit(master: mutable.Map[String, (Long, String)], update: String): mutable.Map[String, (Long, String)] = if (update.isEmpty || update.equals(null))
+  def reconcileMapColumnWithSplit1(master: Map[String, (Long, String)]): Map[String, (Long, String)] = master
+
+  val mapColumnStandardizer = udf(reconcileMapColumnWithSplit _)
+    //udf[mutable.Map[String, (Long, String)], mutable.Map[String, (Long, String)], String](reconcileMapColumnWithSplit _)
+
+  def reconcileMapColumnWithSplit(master: mutable.Map[String, (Long, String)], update: String): mutable.Map[String, (Long, String)] = master/*if (update.isEmpty || update.equals(null))
     master
   else reconcileMapColumn(
     master,
-    update.split(",").map(a => (a, (1l, LocalDateTime.now().toString))).toMap)
+    update.split(",").map(a => (a, (1l, LocalDateTime.now().toString))).toMap)*/
 
 
   def reconcileMapColumn(master: mutable.Map[String, (Long, String)], update: Map[String, (Long, String)]): mutable.Map[String, (Long, String)] = if (update.isEmpty)
     master
   else {
-    val mapColumnElement = update.head
-    val name = mapColumnElement._1
-    val weight = mapColumnElement._2._1
-    val timestamp = mapColumnElement._2._2
-    if (!master.contains(name))
-      master += mapColumnElement
-    else {
-      val tuple = master(name)
-      master.update(name, (tuple._1 + weight, LocalDateTime.now().toString))
-    }
-    reconcileMapColumn(master, update.tail)
+    master
+//    val mapColumnElement = update.head
+//    val name = mapColumnElement._1
+//    val weight = mapColumnElement._2._1
+//    val timestamp = mapColumnElement._2._2
+//    if (!master.contains(name))
+//      master += mapColumnElement
+//    else {
+//      val tuple = master(name)
+//      master.update(name, (tuple._1 + weight, LocalDateTime.now().toString))
+//    }
+//    reconcileMapColumn(master, update.tail)
   }
 
   def createDeltaTableFromDataframe(df: DataFrame, path: String) = df.write.format("delta").save(path)
@@ -123,7 +129,9 @@ object Deltalake {
       .appName("DELTA LAKE POC")
       .config(conf)
       .getOrCreate()
-    spark.sparkContext.setLogLevel("OFF")
+    //spark.sparkContext.setLogLevel("ALL")
+
+    spark.udf.register("mapColumnStandardizer",mapColumnStandardizer)
 
 
     //generatedDataframeUseCase("/Users/joydeep/IdeaProjects/data-partner-merge/src/main/resources/delta/testWhenExp/")
@@ -184,8 +192,9 @@ object Deltalake {
 
   private def getNVLMapForDynamicColumns(conditions: scala.collection.mutable.Map[String, Column])(columns: List[(String, DataType)]) = columns
     .foldLeft(conditions)((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
-      case "brands" | "Interest_IAB" => d += (s"${name._1}.key" -> when(col(s"${update}.${name._1}").isNotNull,
-        mapColumnStandardizer(col(s"${snapshot}.${name._1}"), col(s"${update}.${name._1}")))
+      case "brands" | "Interest_IAB" => d += (s"${snapshot}.${name._1}" -> when(col(s"${update}.${name._1}").isNotNull,
+        //col(s"${update}.${name._1}"))
+        mapColumnStandardizer1(col(s"${snapshot}.${name._1}")))
         .otherwise(col(s"${snapshot}.${name._1}")))
       case _ => conditions
     })
@@ -252,7 +261,7 @@ object Deltalake {
     .foldLeft(scala.collection.mutable.Map[String, Column]())((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
       case "Demographic_MinAge" => d += (s"${name._1}" -> when(col(s"${update}.${name._1}").isNull, col(s"${update}.${name._1}"))
         .otherwise(col(s"${snapshot}.${name._1}")))
-      case "brands" => d
+      case "Interest_IAB" => d
       case _ => addCoalesceToMap(update, d, name)
     })
 
