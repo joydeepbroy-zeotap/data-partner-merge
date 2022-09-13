@@ -1,12 +1,12 @@
 package com.zeotap.merge.dp.poc
 
+import com.zeotap.merge.dp.poc.util.SparkUDFOps.commaSeparatedStringStandardiser
 import io.delta.tables.{DeltaMergeBuilder, DeltaTable}
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
 
-import java.time.LocalDateTime
 import scala.collection.mutable
 
 
@@ -16,7 +16,7 @@ object Deltalake {
   type Format = String
 
   val basePath = "/Users/joydeep/IdeaProjects/data-partner-merge/src/main/resources/delta/onaudience/dpm/base"
-  //createDeltaTable(spark,"/Users/joydeep/Downloads/dpm/onaudience","avro")
+
   //createDeltaTable(spark, "/Users/joydeep/Downloads/ael/onaudience", "avro")
   val snapshot = "snapshot"
   val update = "updates"
@@ -93,30 +93,7 @@ object Deltalake {
 
   case class SomePair(weight: Long, Common_TS: String)
 
-  val mapColumnStandardizer = udf(reconcileMapColumnWithSplit _)
 
-  def reconcileMapColumnWithSplit(master: mutable.Map[String, SomePair], update: String): mutable.Map[String, SomePair] = if (update.isEmpty || update.equals(null))
-    master
-  else reconcileMapColumn(
-    master,
-    update.split(",").map(a => (a, (1l, LocalDateTime.now().toString))).toMap)
-
-
-  def reconcileMapColumn(master: mutable.Map[String, SomePair], update: Map[String, (Long, String)]): mutable.Map[String, SomePair] = if (update.isEmpty)
-    master
-  else {
-    val mapColumnElement = update.head
-    val name = mapColumnElement._1
-    val weight = mapColumnElement._2._1
-    val timestamp = mapColumnElement._2._2
-    if (!master.contains(name))
-      master.update(name, SomePair(weight, timestamp))
-    else {
-      val tuple = master(name)
-      master.update(name, SomePair(tuple.weight + weight, timestamp))
-    }
-    reconcileMapColumn(master, update.tail)
-  }
 
   def createDeltaTableFromDataframe(df: DataFrame, path: String) = df.write.format("delta").save(path)
 
@@ -129,8 +106,9 @@ object Deltalake {
       .getOrCreate()
     //spark.sparkContext.setLogLevel("ALL")
 
-    spark.udf.register("mapColumnStandardizer", mapColumnStandardizer)
+    spark.udf.register("mapColumnStandardizer", commaSeparatedStringStandardiser)
 
+    createDeltaTable(spark,"/Users/joydeep/Downloads/dpm/onaudience","avro")
 
     //generatedDataframeUseCase("/Users/joydeep/IdeaProjects/data-partner-merge/src/main/resources/delta/testWhenExp/")
 
@@ -149,21 +127,21 @@ object Deltalake {
     //intersectionDF.show(false)
     //intersectionDF.count()
 
-    val cdc = explodedUpdates.filter("id == '133900b3-44f1-43fe-873f-f4bde3dfd6af'")
-      //.drop("Demographic_Gender")
-      .withColumn("Demographic_Gender",
-        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), null).otherwise(col("Demographic_Gender")))
-      .withColumn("Demographic_MinAge",
-        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), lit(null).cast(IntegerType)).otherwise(col("Demographic_MinAge")))
-      .withColumn("Demographic_MaxAge",
-        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), 78).otherwise(col("Demographic_MaxAge")))
-    //val columns = List("Demographic_MinAge", "Demographic_MaxAge", "Demographic_Gender")
-    //val columns = List(("Demographic_MinAge", IntegerType), ("Demographic_MaxAge", IntegerType), ("Demographic_Gender", StringType))
+//    val cdc = explodedUpdates.filter("id == '133900b3-44f1-43fe-873f-f4bde3dfd6af'")
+//      //.drop("Demographic_Gender")
+//      .withColumn("Demographic_Gender",
+//        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), null).otherwise(col("Demographic_Gender")))
+//      .withColumn("Demographic_MinAge",
+//        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), lit(null).cast(IntegerType)).otherwise(col("Demographic_MinAge")))
+//      .withColumn("Demographic_MaxAge",
+//        when(col("id").equalTo("133900b3-44f1-43fe-873f-f4bde3dfd6af"), 78).otherwise(col("Demographic_MaxAge")))
+//    //val columns = List("Demographic_MinAge", "Demographic_MaxAge", "Demographic_Gender")
+//    //val columns = List(("Demographic_MinAge", IntegerType), ("Demographic_MaxAge", IntegerType), ("Demographic_Gender", StringType))
 
 
     val dmb: DeltaMergeBuilder = deltaTable
       .as(snapshot)
-      .merge(cdc.as(update), s"$id_condition and $id_type_condition")
+      .merge(explodedUpdates.as(update), s"$id_condition and $id_type_condition")
 
 
     //    val deltaMergeBuilder = builderWithSimpleMatch(dmb)
@@ -178,8 +156,8 @@ object Deltalake {
 
     val updateBuilder = dmb.whenMatched()
       .update(allConditions)
-    /*.whenNotMatched()
-    .insertAll()*/
+    .whenNotMatched()
+    .insertAll()
 
     updateBuilder.execute()
 
@@ -192,7 +170,7 @@ object Deltalake {
     .foldLeft(conditions)((d: mutable.Map[String, Column], name: (String, DataType)) => name._1 match {
       case "brands" | "Interest_IAB" => d += (s"${snapshot}.${name._1}" -> when(col(s"${update}.${name._1}").isNotNull,
         //col(s"${update}.${name._1}"))
-        mapColumnStandardizer(
+        commaSeparatedStringStandardiser(
           col(s"${snapshot}.${name._1}"), col(s"${update}.${name._1}"))
       )
         .otherwise(col(s"${snapshot}.${name._1}")))
@@ -299,8 +277,8 @@ object Deltalake {
   def createDeltaTable(sparkSession: SparkSession, path: String, format: Format): BlobPath = {
     format match {
       case "avro" =>
-        val df = sparkSession.read.format("avro").load(path).write.format("delta")
-        df.save(path)
+        val df = sparkSession.read.format("avro").load(path).write.partitionBy("id_type").format("delta")
+        df.save(basePath)
     }
     path
   }

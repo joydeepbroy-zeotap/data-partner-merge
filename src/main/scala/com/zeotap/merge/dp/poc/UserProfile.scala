@@ -1,5 +1,10 @@
 package com.zeotap.merge.dp.poc
 
+import com.zeotap.merge.dp.poc.ingestion.ProfileColumn
+
+object UserProfile{
+
+}
 case class UserProfile(Common_TS: String,
                        Interest_IAB: String,
                        Demographic_MinAge: Int,
@@ -12,4 +17,9 @@ case class UserProfile(Common_TS: String,
                        Common_DataPartnerID: Int,
                        CREATED_TS: Long,
                        cookies: Map[String, String]
-                      )
+                      ){
+
+  val columns: List[ProfileColumn] = List(
+    ProfileColumn("", String)
+  )
+}
